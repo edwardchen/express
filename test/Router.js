@@ -4,6 +4,7 @@ var after = require('after');
 var express = require('../')
   , Router = express.Router
   , methods = require('../lib/utils').methods
+  , EventEmitter = require('node:events').EventEmitter
   , assert = require('node:assert');
 
 describe('Router', function () {
@@ -202,6 +203,248 @@ describe('Router', function () {
     it('should not throw if all callbacks are functions', function () {
       var router = new Router();
       router.route('/foo').all(function () { }).all(function () { });
+    })
+  })
+
+  describe('cooperative dispatch', function () {
+    it('should preserve ordering when disabled', function (done) {
+      var router = new Router()
+      var order = []
+
+      router.use(function (req, res, next) {
+        order.push('a')
+        next()
+      })
+
+      router.use(function (req, res, next) {
+        order.push('b')
+        next()
+      })
+
+      router.use(function (req, res) {
+        order.push('c')
+        assert.deepStrictEqual(order, ['a', 'b', 'c'])
+        res.end()
+      })
+
+      router.handle({ url: '/', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should yield and preserve ordering when enabled', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+
+      var order = []
+
+      router.use(function (req, res, next) {
+        order.push('a')
+        next()
+      })
+
+      router.use(function (req, res, next) {
+        order.push('b')
+        next()
+      })
+
+      router.use(function (req, res) {
+        order.push('c')
+        assert.deepStrictEqual(order, ['a', 'b', 'c'])
+        assert.ok(req._cooperativeDispatch.yields >= 1)
+        res.end()
+      })
+
+      router.handle({ url: '/', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should yield during a long synchronous chain', function (done) {
+      this.timeout(5000)
+
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 10,
+          maxTimeMs: 1000
+        }
+      })
+
+      for (var i = 0; i < 200; i++) {
+        router.use(function (req, res, next) {
+          next()
+        })
+      }
+
+      router.use(function (req, res) {
+        assert.ok(req._cooperativeDispatch.yields > 0)
+        res.end()
+      })
+
+      router.handle({ url: '/', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should honor next("route") with cooperative dispatch', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var order = []
+
+      router.get('/thing', function (req, res, next) {
+        order.push('first')
+        next('route')
+      }, function (req, res, next) {
+        order.push('skip')
+        next()
+      })
+
+      router.get('/thing', function (req, res) {
+        order.push('second')
+        assert.deepStrictEqual(order, ['first', 'second'])
+        res.end()
+      })
+
+      router.handle({ url: '/thing', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should honor next("router") with nested routers', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var child = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var order = []
+
+      child.get('/child', function (req, res, next) {
+        order.push('child')
+        next('router')
+      }, function (req, res, next) {
+        order.push('child-skip')
+        next()
+      })
+
+      router.use('/parent', child)
+      router.get('/parent/child', function (req, res) {
+        order.push('parent')
+        assert.deepStrictEqual(order, ['child', 'parent'])
+        res.end()
+      })
+
+      router.handle({ url: '/parent/child', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should traverse error handlers with cooperative dispatch', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var order = []
+
+      router.use(function (req, res, next) {
+        order.push('before-error')
+        next(new Error('boom'))
+      })
+
+      router.use(function (err, req, res, next) {
+        order.push('error-handler')
+        next()
+      })
+
+      router.use(function (req, res) {
+        order.push('after-error')
+        assert.deepStrictEqual(order, ['before-error', 'error-handler', 'after-error'])
+        res.end()
+      })
+
+      router.handle({ url: '/', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should handle promise rejections with cooperative dispatch', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var order = []
+
+      router.use(function () {
+        order.push('promise')
+        return Promise.reject(new Error('boom'))
+      })
+
+      router.use(function (err, req, res, next) {
+        order.push('error')
+        next()
+      })
+
+      router.use(function (req, res) {
+        order.push('done')
+        assert.deepStrictEqual(order, ['promise', 'error', 'done'])
+        res.end()
+      })
+
+      router.handle({ url: '/', method: 'GET' }, { end: done }, function (err) {
+        if (err) return done(err)
+      })
+    })
+
+    it('should stop after close when yielding', function (done) {
+      var router = new Router({
+        cooperativeDispatch: {
+          maxLayers: 1,
+          maxTimeMs: 1000
+        }
+      })
+      var order = []
+      var req = new EventEmitter()
+      var res = new EventEmitter()
+
+      req.url = '/'
+      req.method = 'GET'
+      res.end = function () {}
+
+      router.use(function (req, res, next) {
+        order.push('first')
+        next()
+        res.emit('close')
+      })
+
+      router.use(function (req, res, next) {
+        order.push('second')
+        next()
+      })
+
+      router.handle(req, res, function () {})
+
+      setImmediate(function () {
+        assert.deepStrictEqual(order, ['first'])
+        done()
+      })
     })
   })
 
